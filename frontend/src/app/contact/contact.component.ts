@@ -97,6 +97,7 @@ export class ContactComponent implements OnInit {
     this.feedbackControl.markAsUntouched()
     this.feedbackControl.markAsPristine()
     this.feedbackControl.setValue('')
+    this.rating = 0
     this.captchaControl.markAsUntouched()
     this.captchaControl.markAsPristine()
     this.captchaControl.setValue('')
@@ -108,4 +109,6 @@ export class ContactComponent implements OnInit {
     this.captchaControl.setValue('')
   }
 
-}
+  formatRating (value: number) {
+    return value + '★'
+  }}

@@ -17,6 +17,7 @@ import { faGem } from '@fortawesome/free-regular-svg-icons'
 import { faBtc, faGithub, faGitter } from '@fortawesome/free-brands-svg-icons'
 import { Challenge } from '../Models/challenge.model'
 import { TranslateService } from '@ngx-translate/core'
+import { LocalBackupService } from '../Services/local-backup.service'
 
 library.add(faStar, faGem, faGitter, faGithub, faBtc, faTrophy, faPollH)
 dom.watch()
@@ -29,7 +30,7 @@ dom.watch()
 export class ScoreBoardComponent implements OnInit {
 
   public availableDifficulties: number[] = [1, 2, 3, 4, 5, 6]
-  public displayedDifficulties: number[] = []
+  public displayedDifficulties: number[] = [1]
   public availableChallengeCategories: string[] = []
   public displayedChallengeCategories: string[] = []
   public toggledMajorityOfDifficulties: boolean = false
@@ -37,11 +38,17 @@ export class ScoreBoardComponent implements OnInit {
   public showSolvedChallenges: boolean = true
   public numDisabledChallenges: number = 0
   public showDisabledChallenges: boolean = false
+  public showOnlyTutorialChallenges: boolean = false
+  public restrictToTutorialsFirst: boolean = false
+  public allTutorialsCompleted: boolean = false
+  public isLastTutorialsTier: boolean = false
+  public tutorialsTier: number = 1
   public disabledEnv?: string
-  public displayedColumns = ['name', 'difficulty', 'description', 'category', 'status']
+  public displayedColumns = ['name', 'difficulty', 'description', 'category', 'tags', 'status']
   public offsetValue = ['100%', '100%', '100%', '100%', '100%', '100%']
   public allowRepeatNotifications: boolean = false
   public showChallengeHints: boolean = true
+  public showVulnerabilityMitigations: boolean = true
   public showHackingInstructor: boolean = true
   public challenges: Challenge[] = []
   public percentChallengesSolved: string = '0'
@@ -50,8 +57,9 @@ export class ScoreBoardComponent implements OnInit {
   public showContributionInfoBox: boolean = true
   public questionnaireUrl: string = 'https://forms.gle/2Tr5m1pqnnesApxN8'
   public appName: string = 'OWASP Juice Shop'
+  public localBackupEnabled: boolean = true
 
-  constructor (private configurationService: ConfigurationService, private challengeService: ChallengeService, private sanitizer: DomSanitizer, private ngZone: NgZone, private io: SocketIoService, private spinner: NgxSpinnerService, private translate: TranslateService) {
+  constructor (private configurationService: ConfigurationService, private challengeService: ChallengeService, private sanitizer: DomSanitizer, private ngZone: NgZone, private io: SocketIoService, private spinner: NgxSpinnerService, private translate: TranslateService, private localBackupService: LocalBackupService) {
   }
 
   ngOnInit () {
@@ -62,45 +70,55 @@ export class ScoreBoardComponent implements OnInit {
     this.showDisabledChallenges = localStorage.getItem('showDisabledChallenges') ? JSON.parse(String(localStorage.getItem('showDisabledChallenges'))) : false
 
     this.configurationService.getApplicationConfiguration().subscribe((config) => {
-      this.allowRepeatNotifications = config.challenges.showSolvedNotifications && config.ctf.showFlagsInNotifications
+      this.allowRepeatNotifications = config.challenges.showSolvedNotifications && config.ctf?.showFlagsInNotifications
       this.showChallengeHints = config.challenges.showHints
+      this.showVulnerabilityMitigations = config.challenges.showMitigations
       this.showHackingInstructor = config.hackingInstructor && config.hackingInstructor.isEnabled
       this.showContributionInfoBox = config.application.showGitHubLinks
       this.questionnaireUrl = config.application.social && config.application.social.questionnaireUrl
       this.appName = config.application.name
-    }, (err) => console.log(err))
+      this.restrictToTutorialsFirst = config.challenges.restrictToTutorialsFirst
+      this.showOnlyTutorialChallenges = localStorage.getItem('showOnlyTutorialChallenges') ? JSON.parse(String(localStorage.getItem('showOnlyTutorialChallenges'))) : this.restrictToTutorialsFirst
+      this.localBackupEnabled = config.application.localBackupEnabled
+      this.challengeService.find({ sort: 'name' }).subscribe((challenges) => {
+        this.challenges = challenges
+        for (let i = 0; i < this.challenges.length; i++) {
+          this.augmentHintText(this.challenges[i])
+          this.trustDescriptionHtml(this.challenges[i])
+          if (this.challenges[i].name === 'Score Board') {
+            this.challenges[i].solved = true
+          }
+          if (!this.availableChallengeCategories.includes(challenges[i].category)) {
+            this.availableChallengeCategories.push(challenges[i].category)
+          }
+          if (this.showHackingInstructor) {
+            import(/* webpackChunkName: "tutorial" */ '../../hacking-instructor').then(module => {
+              challenges[i].hasTutorial = module.hasInstructions(challenges[i].name)
+            })
+          }
+        }
+        this.availableChallengeCategories.sort()
+        this.displayedChallengeCategories = localStorage.getItem('displayedChallengeCategories') ? JSON.parse(String(localStorage.getItem('displayedChallengeCategories'))) : this.availableChallengeCategories
+        this.calculateProgressPercentage()
+        this.populateFilteredChallengeLists()
+        this.calculateGradientOffsets(challenges)
+        this.calculateTutorialTier(challenges)
 
-    this.challengeService.find({ sort: 'name' }).subscribe((challenges) => {
-      this.challenges = challenges
-      for (let i = 0; i < this.challenges.length; i++) {
-        this.augmentHintText(this.challenges[i])
-        this.trustDescriptionHtml(this.challenges[i])
-        if (this.challenges[i].name === 'Score Board') {
-          this.challenges[i].solved = true
-        }
-        if (!this.availableChallengeCategories.includes(challenges[i].category)) {
-          this.availableChallengeCategories.push(challenges[i].category)
-        }
-        if (this.showHackingInstructor) {
-          import(/* webpackChunkName: "tutorial" */ '../../hacking-instructor').then(module => {
-            challenges[i].hasTutorial = module.hasInstructions(challenges[i].name)
+        this.toggledMajorityOfDifficulties = this.determineToggledMajorityOfDifficulties()
+        this.toggledMajorityOfCategories = this.determineToggledMajorityOfCategories()
+
+        if (this.showOnlyTutorialChallenges) {
+          this.challenges.sort((a, b) => {
+            return a.tutorialOrder - b.tutorialOrder
           })
         }
-      }
-      this.availableChallengeCategories.sort()
-      this.displayedChallengeCategories = localStorage.getItem('displayedChallengeCategories') ? JSON.parse(String(localStorage.getItem('displayedChallengeCategories'))) : this.availableChallengeCategories
-      this.calculateProgressPercentage()
-      this.populateFilteredChallengeLists()
-      this.calculateGradientOffsets(challenges)
 
-      this.toggledMajorityOfDifficulties = this.determineToggledMajorityOfDifficulties()
-      this.toggledMajorityOfCategories = this.determineToggledMajorityOfCategories()
-
-      this.spinner.hide()
-    }, (err) => {
-      this.challenges = []
-      console.log(err)
-    })
+        this.spinner.hide()
+      }, (err) => {
+        this.challenges = []
+        console.log(err)
+      })
+    }, (err) => console.log(err))
 
     this.ngZone.runOutsideAngular(() => {
       this.io.socket().on('challenge solved', (data: any) => {
@@ -114,6 +132,7 @@ export class ScoreBoardComponent implements OnInit {
           this.calculateProgressPercentage()
           this.populateFilteredChallengeLists()
           this.calculateGradientOffsets(this.challenges)
+          this.calculateTutorialTier(this.challenges)
         }
       })
     })
@@ -157,25 +176,47 @@ export class ScoreBoardComponent implements OnInit {
     this.percentChallengesSolved = (100 * solvedChallenges / this.challenges.length).toFixed(0)
   }
 
+  calculateTutorialTier (challenges: Challenge[]) {
+    this.allTutorialsCompleted = true
+    this.isLastTutorialsTier = true
+    this.tutorialsTier = 1
+
+    for (let difficulty = 1; difficulty <= 6; difficulty++) {
+      const challengesWithTutorial = challenges.filter((c) => c.tutorialOrder && c.difficulty === difficulty).length
+      const solvedChallengesWithTutorial = challenges.filter((c) => c.tutorialOrder && c.difficulty === difficulty && c.solved).length
+      this.allTutorialsCompleted = this.allTutorialsCompleted && challengesWithTutorial === solvedChallengesWithTutorial
+      if (this.tutorialsTier === difficulty && challengesWithTutorial === solvedChallengesWithTutorial) this.tutorialsTier++
+    }
+    if (!this.allTutorialsCompleted) {
+      this.isLastTutorialsTier = challenges.filter((c) => c.tutorialOrder && !c.solved && c.difficulty > this.tutorialsTier).length === 0
+      for (let tier = 1; tier <= this.tutorialsTier; tier++) {
+        if (!this.displayedDifficulties.includes(tier)) this.toggleDifficulty(this.tutorialsTier)
+      }
+    }
+  }
+
   calculateGradientOffsets (challenges: Challenge[]) {
     for (let difficulty = 1; difficulty <= 6; difficulty++) {
-      let solved = 0
-      let total = 0
+      this.offsetValue[difficulty - 1] = this.calculateGradientOffset(challenges, difficulty)
+    }
+  }
 
-      for (let i = 0; i < challenges.length; i++) {
-        if (challenges[i].difficulty === difficulty) {
-          total++
-          if (challenges[i].solved) {
-            solved++
-          }
+  calculateGradientOffset (challenges: Challenge[], difficulty: number) {
+    let solved = 0
+    let total = 0
+
+    for (let i = 0; i < challenges.length; i++) {
+      if (challenges[i].difficulty === difficulty) {
+        total++
+        if (challenges[i].solved) {
+          solved++
         }
       }
-
-      let offset: any = Math.round(solved * 100 / total)
-      offset = 100 - offset
-      offset = +offset + '%'
-      this.offsetValue[difficulty - 1] = offset
     }
+
+    let offset: any = Math.round(solved * 100 / total)
+    offset = 100 - offset
+    return +offset + '%'
   }
 
   toggleDifficulty (difficulty: number) {
@@ -207,6 +248,22 @@ export class ScoreBoardComponent implements OnInit {
   toggleShowDisabledChallenges () {
     this.showDisabledChallenges = !this.showDisabledChallenges
     localStorage.setItem('showDisabledChallenges', JSON.stringify(this.showDisabledChallenges))
+  }
+
+  toggleShowOnlyTutorialChallenges () {
+    this.showOnlyTutorialChallenges = !this.showOnlyTutorialChallenges
+    localStorage.setItem('showOnlyTutorialChallenges', JSON.stringify(this.showOnlyTutorialChallenges))
+    if (this.showOnlyTutorialChallenges) {
+      this.challenges.sort((a, b) => {
+        return a.tutorialOrder - b.tutorialOrder
+      })
+    } else {
+      this.challenges.sort((a,b) => {
+        if (a.name < b.name) return -1
+        if (a.name > b.name) return 1
+        return 0
+      })
+    }
   }
 
   toggleShowChallengeCategory (category: string) {
@@ -244,7 +301,7 @@ export class ScoreBoardComponent implements OnInit {
       if (!this.displayedChallengeCategories.includes(challenge.category)) return false
       if (!this.showSolvedChallenges && challenge.solved) return false
       if (!this.showDisabledChallenges && challenge.disabledEnv) return false
-      return true
+      return !(this.showOnlyTutorialChallenges && !challenge.hasTutorial)
     })
 
     let dataSource = new MatTableDataSource()
@@ -273,5 +330,17 @@ export class ScoreBoardComponent implements OnInit {
 
   trackById (index: number, item: any) {
     return item.id
+  }
+
+  times (numberOfTimes: number) {
+    return Array(numberOfTimes).fill('★')
+  }
+
+  saveBackup () {
+    this.localBackupService.save(this.appName.toLowerCase().replace(/ /, '_'))
+  }
+
+  restoreBackup (file: File) {
+    this.localBackupService.restore(file)
   }
 }

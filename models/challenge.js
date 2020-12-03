@@ -4,17 +4,20 @@
  */
 
 /* jslint node: true */
-module.exports = (sequelize, { STRING, INTEGER, BOOLEAN }) => {
+module.exports = (sequelize, { STRING, INTEGER, BOOLEAN, NUMBER }) => {
   const Challenge = sequelize.define('Challenge', {
     key: STRING,
     name: STRING,
     category: STRING,
+    tags: STRING,
     description: STRING,
     difficulty: INTEGER,
     hint: STRING,
     hintUrl: STRING,
+    mitigationUrl: STRING,
     solved: BOOLEAN,
-    disabledEnv: STRING
+    disabledEnv: STRING,
+    tutorialOrder: NUMBER
   })
   return Challenge
 }

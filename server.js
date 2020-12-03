@@ -2,15 +2,16 @@
  * Copyright (c) 2014-2020 Bjoern Kimminich.
  * SPDX-License-Identifier: MIT
  */
-
+const startTime = Date.now()
 const path = require('path')
-const fs = require('fs-extra')
+const fs = require('fs')
 const morgan = require('morgan')
 const colors = require('colors/safe')
 const finale = require('finale-rest')
 const express = require('express')
 const compression = require('compression')
 const helmet = require('helmet')
+const featurePolicy = require('feature-policy')
 const errorhandler = require('errorhandler')
 const cookieParser = require('cookie-parser')
 const serveIndex = require('serve-index')
@@ -21,6 +22,7 @@ const robots = require('express-robots-txt')
 const yaml = require('js-yaml')
 const swaggerUi = require('swagger-ui-express')
 const RateLimit = require('express-rate-limit')
+const client = require('prom-client')
 const swaggerDocument = yaml.load(fs.readFileSync('./swagger.yml', 'utf8'))
 const {
   ensureFileIsPassed,
@@ -41,6 +43,7 @@ const repeatNotification = require('./routes/repeatNotification')
 const continueCode = require('./routes/continueCode')
 const restoreProgress = require('./routes/restoreProgress')
 const fileServer = require('./routes/fileServer')
+const quarantineServer = require('./routes/quarantineServer')
 const keyServer = require('./routes/keyServer')
 const logFileServer = require('./routes/logfileServer')
 const metrics = require('./routes/metrics')
@@ -90,13 +93,30 @@ const orderHistory = require('./routes/orderHistory')
 const delivery = require('./routes/delivery')
 const deluxe = require('./routes/deluxe')
 const memory = require('./routes/memory')
+const chatbot = require('./routes/chatbot')
 const locales = require('./data/static/locales')
 const i18n = require('i18n')
 
-require('./lib/startup/restoreOverwrittenFilesWithOriginals')()
-require('./lib/startup/cleanupFtpFolder')()
-require('./lib/startup/validatePreconditions')()
-require('./lib/startup/validateConfig')()
+const appName = config.get('application.customMetricsPrefix')
+const startupGauge = new client.Gauge({
+  name: `${appName}_startup_duration_seconds`,
+  help: `Duration ${appName} required to perform a certain task during startup`,
+  labelNames: ['task']
+})
+
+// Wraps the function and measures its (async) execution time
+const collectDurationPromise = (name, func) => {
+  return async (...args) => {
+    const end = startupGauge.startTimer({ task: name })
+    const res = await func(...args)
+    end()
+    return res
+  }
+}
+collectDurationPromise('validatePreconditions', require('./lib/startup/validatePreconditions'))()
+collectDurationPromise('restoreOverwrittenFilesWithOriginals', require('./lib/startup/restoreOverwrittenFilesWithOriginals'))()
+collectDurationPromise('cleanupFtpFolder', require('./lib/startup/cleanupFtpFolder'))()
+collectDurationPromise('validateConfig', require('./lib/startup/validateConfig'))()
 
 const multer = require('multer')
 const uploadToMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200000 } })
@@ -146,6 +166,12 @@ app.use(cors())
 app.use(helmet.noSniff())
 app.use(helmet.frameguard())
 // app.use(helmet.xssFilter()); // = no protection from persisted XSS via RESTful API
+app.disable('x-powered-by')
+app.use(featurePolicy({
+  features: {
+    payment: ["'self'"]
+  }
+}))
 
 /* Remove duplicate slashes from URL which allowed bypassing subsequent filters */
 app.use((req, res, next) => {
@@ -176,16 +202,41 @@ app.use('/assets/i18n', verify.accessControlChallenges())
 /* Checks for challenges solved by abusing SSTi and SSRF bugs */
 app.use('/solve/challenges/server-side', verify.serverSideChallenges())
 
+/* Create middleware to change paths from the serve-index plugin from absolute to relative */
+const serveIndexMiddleware = (req, res, next) => {
+  const origEnd = res.end
+  res.end = function () {
+    if (arguments.length) {
+      const reqPath = req.originalUrl.replace(/\?.*$/, '')
+      const currentFolder = reqPath.split('/').pop()
+      arguments[0] = arguments[0].replace(/a href="([^"]+?)"/gi, function (matchString, matchedUrl) {
+        let relativePath = path.relative(reqPath, matchedUrl)
+        if (relativePath === '') {
+          relativePath = currentFolder
+        } else if (!relativePath.startsWith('.') && currentFolder !== '') {
+          relativePath = currentFolder + '/' + relativePath
+        } else {
+          relativePath = relativePath.replace('..', '.')
+        }
+        return 'a href="' + relativePath + '"'
+      })
+    }
+    origEnd.apply(this, arguments)
+  }
+  next()
+}
+
 /* /ftp directory browsing and file download */
-app.use('/ftp', serveIndex('ftp', { icons: true }))
-app.use('/ftp/:file', fileServer())
+app.use('/ftp', serveIndexMiddleware, serveIndex('ftp', { icons: true }))
+app.use('/ftp(?!/quarantine)/:file', fileServer())
+app.use('/ftp/quarantine/:file', quarantineServer())
 
 /* /encryptionkeys directory browsing */
-app.use('/encryptionkeys', serveIndex('encryptionkeys', { icons: true, view: 'details' }))
+app.use('/encryptionkeys', serveIndexMiddleware, serveIndex('encryptionkeys', { icons: true, view: 'details' }))
 app.use('/encryptionkeys/:file', keyServer())
 
 /* /logs directory browsing */
-app.use('/support/logs', serveIndex('logs', { icons: true, view: 'details' }))
+app.use('/support/logs', serveIndexMiddleware, serveIndex('logs', { icons: true, view: 'details' }))
 app.use('/support/logs', verify.accessControlChallenges())
 app.use('/support/logs/:file', logFileServer())
 
@@ -461,7 +512,7 @@ app.post('/rest/user/login', login())
 app.get('/rest/user/change-password', changePassword())
 app.post('/rest/user/reset-password', resetPassword())
 app.get('/rest/user/security-question', securityQuestion())
-app.get('/rest/user/whoami', currentUser())
+app.get('/rest/user/whoami', insecurity.updateAuthenticatedUsers(), currentUser())
 app.get('/rest/user/authentication-details', authenticatedUsers())
 app.get('/rest/products/search', search())
 app.get('/rest/basket/:id', basket())
@@ -489,7 +540,9 @@ app.get('/rest/wallet/balance', insecurity.appendUserId(), wallet.getWalletBalan
 app.put('/rest/wallet/balance', insecurity.appendUserId(), wallet.addWalletBalance())
 app.get('/rest/deluxe-membership', deluxe.deluxeMembershipStatus())
 app.post('/rest/deluxe-membership', insecurity.appendUserId(), deluxe.upgradeToDeluxe())
-app.get('/rest/memories', memory.getMemory())
+app.get('/rest/memories', memory.getMemories())
+app.get('/rest/chatbot/status', chatbot.status())
+app.post('/rest/chatbot/respond', chatbot.process())
 /* NoSQL API endpoints */
 app.get('/rest/products/:id/reviews', showProductReviews())
 app.put('/rest/products/:id/reviews', createProductReviews())
@@ -512,7 +565,7 @@ app.get('/promotion', videoHandler.promotionVideo())
 app.get('/video', videoHandler.getVideo())
 
 /* Routes for profile page */
-app.get('/profile', userProfile())
+app.get('/profile', insecurity.updateAuthenticatedUsers(), userProfile())
 app.post('/profile', updateUserProfile())
 
 app.use(angular())
@@ -522,20 +575,27 @@ app.use(verify.errorHandlingChallenge())
 app.use(errorhandler())
 
 exports.start = async function (readyCallback) {
+  const datacreatorEnd = startupGauge.startTimer({ task: 'datacreator' })
   await models.sequelize.sync({ force: true })
   await datacreator()
+  datacreatorEnd()
   const port = process.env.PORT || config.get('server.port')
+  process.env.BASE_PATH = process.env.BASE_PATH || config.get('server.basePath')
 
   server.listen(port, () => {
-    logger.info(colors.cyan(`Server listening on port ${port}`))
+    logger.info(colors.cyan(`Server listening on port ${colors.bold(port)}`))
+    startupGauge.set({ task: 'ready' }, (Date.now() - startTime) / 1000)
+    if (process.env.BASE_PATH !== '') {
+      logger.info(colors.cyan(`Server using proxy base path ${colors.bold(process.env.BASE_PATH)} for redirects`))
+    }
     require('./lib/startup/registerWebsocketEvents')(server)
     if (readyCallback) {
       readyCallback()
     }
   })
 
-  require('./lib/startup/customizeApplication')()
-  require('./lib/startup/customizeEasterEgg')()
+  collectDurationPromise('customizeApplication', require('./lib/startup/customizeApplication'))()
+  collectDurationPromise('customizeEasterEgg', require('./lib/startup/customizeEasterEgg'))()
 }
 
 exports.close = function (exitCode) {
